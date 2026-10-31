@@ -1,0 +1,15 @@
+# build outputs
+/bin/
+/obj/
+/.vs/
+
+# compiled binaries / intermediates
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.log
+
+# local transfer state / partial files
+.filecopy.state
+*.filecopy
