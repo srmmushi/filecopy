@@ -116,7 +116,7 @@
 #define FC_NAME            "filecopy"
 #define PROTO_MAGIC        "FCP1"
 #define HDR_LEN            13      /* 4 魔数 + 1 命令 + 8 大端长度 */
-#define DEFAULT_THREADS    8
+#define DEFAULT_THREADS    4       /* 并发数据连接数（越大窗口竞争越严重） */
 #define MAX_THREADS        64
 #define CHUNK_BYTES        (8ull * 1024ull * 1024ull)  /* 固定分片大小 8 MiB */
 #define MAX_CHUNKS         65536  /* 分片索引上限保护（8 MiB * 65536 = 512 GiB） */
@@ -131,6 +131,7 @@
 #define MAX_PATH_BUF       8192
 #define MAX_CHUNK_ATTEMPTS 8       /* 单个分片最多重试次数 */
 #define MAX_CONNECT_TRIES  10      /* 初次连接服务端最多尝试次数 */
+#define QUEUE_DEPTH        16      /* 接收->写盘队列深度（每块 CHUNK_BYTES=8MiB，共 128MiB） */
 
 /* 命令字 */
 enum {
@@ -731,9 +732,21 @@ static void mutex_unlock(mutex_t *m) { ReleaseSRWLockExclusive(m); }
 /* 返回 0 表示成功获取（与 pthread_mutex_trylock 的 0/EBUSY 语义对齐） */
 static int mutex_trylock(mutex_t *m) { return TryAcquireSRWLockExclusive(m) ? 0 : 1; }
 static void mutex_destroy(mutex_t *m) { (void)m; }
+
+/* 条件变量：Win32 CONDITION_VARIABLE + SRWLOCK（队列用） */
+typedef CONDITION_VARIABLE cond_t;
+static int cond_init(cond_t *c) { InitializeConditionVariable(c); return 0; }
+static void cond_destroy(cond_t *c) { (void)c; }
+static void cond_signal(cond_t *c) { WakeConditionVariable(c); }
+static void cond_broadcast(cond_t *c) { WakeAllConditionVariable(c); }
+static void cond_wait(cond_t *c, mutex_t *m)
+{
+    SleepConditionVariableSRW(c, m, INFINITE, 0);
+}
 #else
 typedef pthread_t thread_t;
 typedef pthread_mutex_t mutex_t;
+typedef pthread_cond_t cond_t;
 
 static int thread_create(thread_t *t, thread_fn fn, void *arg)
 {
@@ -747,6 +760,12 @@ static void mutex_lock(mutex_t *m) { pthread_mutex_lock(m); }
 static void mutex_unlock(mutex_t *m) { pthread_mutex_unlock(m); }
 static int mutex_trylock(mutex_t *m) { return pthread_mutex_trylock(m); }
 static void mutex_destroy(mutex_t *m) { pthread_mutex_destroy(m); }
+
+static int cond_init(cond_t *c) { return pthread_cond_init(c, NULL); }
+static void cond_destroy(cond_t *c) { pthread_cond_destroy(c); }
+static void cond_signal(cond_t *c) { pthread_cond_signal(c); }
+static void cond_broadcast(cond_t *c) { pthread_cond_broadcast(c); }
+static void cond_wait(cond_t *c, mutex_t *m) { pthread_cond_wait(c, m); }
 #endif
 
 /* ======================== 协议头收发与握手 ======================== */
@@ -1011,7 +1030,12 @@ static void close_file_fd(int fd)
 #endif
 }
 
-/* 在指定偏移写入完整数据；每个下载线程使用各自独立的 fd，因此无需加锁 */
+/* 在指定偏移写入完整数据（保留给需要定位写的场景，例如旧版合并逻辑）。
+ * 当前接收端改为“每分片独立临时文件 + 顺序合并”，不再调用本函数，
+ * 因此用可移植的“未使用”标记避免 -Wunused-function 告警。 */
+#if defined(__GNUC__) && !defined(_MSC_VER)
+__attribute__((unused))
+#endif
 static int write_at(int fd, const void *buf, size_t len, uint64_t off)
 {
     const char *p = (const char *)buf;
@@ -1385,6 +1409,37 @@ typedef struct {
     const char *apikey;
 } server_info;
 
+/* ======================== 接收端流水线：recv 与写盘解耦 ========================
+ *
+ * 问题：原来的下载线程在一条路径里 先 recv(64KB) 再 write(64KB)，
+ * 只要磁盘稍慢（杀毒扫描、机械盘、SMB），recv 就会停下来，
+ * 接收缓冲区被填满 => 接收窗口降到 0 => 发送端 send() 阻塞等待窗口，
+ * 表现为 send 端单次 send 卡 10~16 秒、单分片 25~150 秒。
+ *
+ * 方案：接收线程只负责 recv 并入队（队列深度 QUEUE_DEPTH 块），
+ * 独立的写盘线程从队列取块写文件；网络吞吐与磁盘延迟彻底解耦。
+ */
+
+typedef struct {
+    uint32_t chunk_idx;   /* 分片序号 */
+    uint64_t off;         /* 在文件中的偏移 */
+    uint64_t len;         /* 实际字节数 */
+    uint8_t *data;        /* 数据（CHUNK_BYTES 预分配） */
+} qslot;
+
+typedef struct {
+    qslot *items;
+    unsigned cap;
+    unsigned head;        /* 写盘线程取走的位置 */
+    unsigned tail;        /* 入队位置 */
+    unsigned count;       /* 队列内元素数 */
+    int closed;           /* 生产者结束（不再入队） */
+    int aborted;          /* 写盘失败，通知生产者停止 */
+    mutex_t mu;
+    cond_t not_empty;
+    cond_t not_full;
+} chunk_queue;
+
 typedef struct {
     const server_info *srv;
     uint32_t file_id;
@@ -1403,6 +1458,7 @@ typedef struct {
     int failed;                     /* 是否有线程判定失败 */
 
     mutex_t state_mu;               /* 保护计数、状态位图与状态文件写入 */
+    chunk_queue *q;                 /* recv -> 写盘 队列（可为 NULL） */
     state_store *st;
     const char *state_file;
     state_entry *entry;
@@ -1421,32 +1477,118 @@ static sock_t connect_and_auth(const server_info *srv)
     return s;
 }
 
-/* 从连接上流式接收分片数据并写到文件偏移处。
- * 按 NET_IO_UNIT(64KB) 反复 recv，直到读满协议头声明的 len；
- * 阻塞套接字下 recv_all_ex 内部已处理好部分接收与 WSAEWOULDBLOCK。 */
-static int recv_chunk_into_file(sock_t s, int fd, uint64_t off, uint64_t len,
-                                io_stat *st, const char *tag)
+/* 队列操作实现（类型定义见上方，须先于 dl_ctx 声明） */
+
+static int queue_init(chunk_queue *q, unsigned depth)
 {
-    uint8_t *buf = (uint8_t *)malloc((size_t)NET_IO_UNIT);
-    if (!buf) return -1;
-    uint64_t got = 0;
-    int rc = 0;
-    while (got < len) {
-        size_t want = (size_t)(len - got);
-        if (want > (size_t)NET_IO_UNIT) want = (size_t)NET_IO_UNIT;
-        if (recv_all_ex(s, buf, want, st, tag) != 0) {
-            rc = -1;
-            break;
-        }
-        if (write_at(fd, buf, want, off + got) != 0) {
-            rc = -1;
-            break;
-        }
-        got += want;
-    }
-    free(buf);
-    return rc;
+    memset(q, 0, sizeof *q);
+    q->items = (qslot *)calloc(depth, sizeof(qslot));
+    if (!q->items) return -1;
+    q->cap = depth;
+    mutex_init(&q->mu);
+    cond_init(&q->not_empty);
+    cond_init(&q->not_full);
+    return 0;
 }
+
+static void queue_destroy(chunk_queue *q)
+{
+    if (!q->items) return;
+    for (unsigned i = 0; i < q->cap; i++) free(q->items[i].data);
+    free(q->items);
+    q->items = NULL;
+    mutex_destroy(&q->mu);
+    cond_destroy(&q->not_empty);
+    cond_destroy(&q->not_full);
+}
+
+/* 队列操作实现（类型定义见上方，须先于 dl_ctx 声明）。
+ *
+ * 关键设计约束（修复随机丢块）：
+ *   队列里的每一格必须是“数据已经完全填好”的块。
+ *   因此接收线程先用 queue_alloc_buf() 拿到一块独立缓冲区（不受队列容量限制），
+ *   recv 填满后再用 queue_push() 一次性挂到队尾；写盘线程只从队首取。
+ *   之前“先占位后填充”的写法会让写盘线程取到正在填充的槽位，导致随机丢块。
+ */
+
+/* 申请一块接收缓冲区；队列已满则阻塞，防止内存无限增长 */
+static uint8_t *queue_alloc_buf(chunk_queue *q)
+{
+    uint8_t *buf = NULL;
+    mutex_lock(&q->mu);
+    while (q->count >= q->cap && !q->closed && !q->aborted && !g_stop)
+        cond_wait(&q->not_full, &q->mu);
+    if (!q->closed && !q->aborted && !g_stop) {
+        buf = (uint8_t *)malloc((size_t)CHUNK_BYTES);
+        if (!buf) {
+            fprintf(stderr, "[recv] out of memory allocating %llu B chunk buffer\n",
+                    (unsigned long long)CHUNK_BYTES);
+            q->aborted = 1;
+            cond_broadcast(&q->not_full);
+            cond_broadcast(&q->not_empty);
+        }
+    }
+    mutex_unlock(&q->mu);
+    return buf;
+}
+
+/* 把已填满的缓冲区连同元信息入队 */
+static int queue_push(chunk_queue *q, uint8_t *buf, uint32_t ci, uint64_t off,
+                      uint64_t len)
+{
+    int ok = 0;
+    mutex_lock(&q->mu);
+    if (!q->closed && !q->aborted) {
+        unsigned idx = q->tail % q->cap;
+        qslot *s = &q->items[idx];
+        free(s->data);              /* 上一轮遗留的缓冲区（理论上已被释放成 NULL） */
+        s->data = buf;
+        s->chunk_idx = ci;
+        s->off = off;
+        s->len = len;
+        q->tail = (q->tail + 1) % q->cap;
+        q->count++;
+        cond_signal(&q->not_empty);
+        ok = 1;
+    }
+    mutex_unlock(&q->mu);
+    if (!ok) free(buf);
+    return ok ? 0 : -1;
+}
+
+/* 取队首的已完成块；返回 NULL 表示队列已关闭且为空 */
+static qslot *queue_pop(chunk_queue *q)
+{
+    qslot *s = NULL;
+    mutex_lock(&q->mu);
+    while (q->count == 0 && !q->closed) cond_wait(&q->not_empty, &q->mu);
+    if (q->count > 0) {
+        s = &q->items[q->head % q->cap];
+        q->head = (q->head + 1) % q->cap;
+        q->count--;
+        cond_signal(&q->not_full);
+    }
+    mutex_unlock(&q->mu);
+    return s;
+}
+
+/* 写盘完成，归还该块缓冲区（防止重复释放，置 NULL） */
+static void queue_release_slot(chunk_queue *q, qslot *slot)
+{
+    (void)q;
+    free(slot->data);
+    slot->data = NULL;
+}
+
+static void queue_close(chunk_queue *q)
+{
+    mutex_lock(&q->mu);
+    q->closed = 1;
+    cond_broadcast(&q->not_empty);
+    cond_broadcast(&q->not_full);
+    mutex_unlock(&q->mu);
+}
+
 
 /* 下面三个小函数在 state_mu 保护下访问共享计数与失败标志。
  * （MSVC 不提供 stdatomic.h，统一用互斥量，计数操作开销可忽略。） */
@@ -1479,11 +1621,91 @@ static int dl_claim_chunk(dl_ctx *c, uint32_t *out)
     return ok ? 0 : -1;
 }
 
-/* 单个下载线程：循环领取分片 => 建/复用自己的连接 => 拉取 => 记录状态 */
+/* ---------- 写盘线程：从队列取整块数据，写入本分片自己的临时文件 ----------
+ *
+ * 每个分片只写自己的 chunk_N.filecopy，写完整块后直接关闭，
+ * 避免多个线程对同一个大文件频繁 fseek + write（Windows 上还有锁竞争）。
+ * 全部块写完后由 download_one_file 按序号合并成正式文件。
+ */
+typedef struct {
+    chunk_queue *q;
+    const char *work_dir;    /* 临时分片目录 */
+    uint64_t parts_written;  /* 已写字节 */
+    uint32_t blocks_written; /* 已写块数 */
+    int failed;
+} writer_ctx;
+
+static char *chunk_part_path(const writer_ctx *w, uint32_t ci)
+{
+    char name[64];
+    char full[MAX_PATH_BUF];
+    snprintf(name, sizeof name, "chunk_%06u.filecopy", (unsigned)ci);
+    if (join_path_buf(full, sizeof full, w->work_dir, name) != 0) return NULL;
+    return xstrdup(full);
+}
+
+static void *writer_thread(void *arg)
+{
+    writer_ctx *w = (writer_ctx *)arg;
+    chunk_queue *q = w->q;
+
+    for (;;) {
+        qslot *s = queue_pop(q);
+        if (!s) break;                    /* 生产者结束且队列空 */
+
+        uint64_t t_w = now_ms();
+        char *ppath = chunk_part_path(w, s->chunk_idx);
+        FILE *f = ppath ? fopen(ppath, "wb") : NULL;
+        if (!f) {
+            fprintf(stderr, "[recv] cannot open chunk part file: %s\n",
+                    ppath ? ppath : "(path too long)");
+            free(ppath);
+            queue_release_slot(q, s);
+            w->failed = 1;
+            queue_close(q);
+            break;
+        }
+        /* 整块一次顺序写出（8MiB），随后关闭，落盘由 OS 合并 */
+        size_t wrote = fwrite(s->data, 1, (size_t)s->len, f);
+        fflush(f);
+        fclose(f);
+        free(ppath);
+
+        if (wrote != (size_t)s->len) {
+            fprintf(stderr, "[recv] write failed for chunk %u (%zu/%lu B)\n",
+                    s->chunk_idx, wrote, (unsigned long)s->len);
+            queue_release_slot(q, s);
+            w->failed = 1;
+            queue_close(q);
+            break;
+        }
+        w->parts_written += s->len;
+        w->blocks_written++;
+
+        if (g_trace) {
+            fprintf(stdout, "[recv] write chunk %u %lu B in %llu ms\n",
+                    s->chunk_idx, (unsigned long)s->len,
+                    (unsigned long long)(now_ms() - t_w));
+        }
+        queue_release_slot(q, s);   /* 归还缓冲区 */
+    }
+    return NULL;
+}
+
+/* 登记一个分片已完成（在 state_mu 保护下，只做内存计数，不落盘）。 */
+static void dl_mark_chunk_done(dl_ctx *c, uint32_t ci, uint64_t len)
+{
+    mutex_lock(&c->state_mu);
+    c->entry->bitmap |= ((uint64_t)1 << ci);
+    c->done++;
+    c->done_bytes += len;
+    mutex_unlock(&c->state_mu);
+}
+
+/* 单个下载线程：循环领取分片 => 建/复用自己的连接 => recv 入队 => 记录状态 */
 static void *dl_worker_thread(void *arg)
 {
     dl_ctx *c = (dl_ctx *)arg;
-    int fd = -1;
     sock_t sock = SOCK_INVALID;
     uint32_t ci = 0;
 
@@ -1543,31 +1765,42 @@ static void *dl_worker_thread(void *arg)
                 continue;
             }
 
-            if (fd < 0) {
-                fd = open_file_rw_fd(c->partial_path, 0);
-                if (fd < 0) {
-                    fprintf(stderr, "[recv] cannot open partial file for writing: %s\n",
-                            c->partial_path);
-                    dl_set_failed(c);
-                    break;
-                }
+            /* ---------- 纯接收路径：只 recv 入队，不碰磁盘 ---------- */
+            if (len > (uint64_t)CHUNK_BYTES) {
+                dl_set_failed(c);
+                break;
             }
-            /* 请求该块并读满协议头声明的长度（64KB 循环 recv + 落盘） */
-            io_stat stt;
-            memset(&stt, 0, sizeof stt);
-            if (recv_chunk_into_file(sock, fd, off, len, &stt,
-                                     g_trace ? c->rel_path : NULL) != 0) {
+            uint8_t *buf = queue_alloc_buf(c->q);
+            if (!buf) {
+                if (g_stop) break;
+                dl_set_failed(c);
+                break;
+            }
+            uint64_t t_recv = now_ms();
+            if (recv_all_ex(sock, buf, (size_t)len, NULL, NULL) != 0) {
+                free(buf);            /* 本次数据作废，缓冲直接丢弃，不入队 */
                 sock_close(sock);
                 sock = SOCK_INVALID;
                 continue;
             }
-            if (g_trace) {
-                uint64_t ms = now_ms() - t_chunk;
-                fprintf(stdout, "[trace] %s chunk %u recv %llu calls, slowest %llu ms, "
-                                "chunk total %llu ms\n",
-                        c->rel_path, ci, (unsigned long long)stt.calls,
-                        (unsigned long long)stt.max_ms,
-                        (unsigned long long)ms);
+            uint64_t recv_ms = now_ms() - t_recv;
+            uint64_t t_q = now_ms();
+            if (queue_push(c->q, buf, ci, off, len) != 0) {
+                if (g_stop) break;
+                dl_set_failed(c);
+                break;
+            }
+            uint64_t queue_ms = now_ms() - t_q;
+
+            /* 每收满一个 8MB 分片打印：recv 耗时与入队耗时（证明 recv 本身不慢） */
+            if (g_trace || len == (uint64_t)CHUNK_BYTES) {
+                double secs = (double)recv_ms / 1000.0;
+                double mbps = secs > 0.0 ? (double)len / secs / (1024.0 * 1024.0) : 0.0;
+                fprintf(stdout, "[recv] recv chunk %u %lu B in %llu ms (%.1f MiB/s), "
+                                "enqueue %llu ms\n",
+                        ci, (unsigned long)len, (unsigned long long)recv_ms, mbps,
+                        (unsigned long long)queue_ms);
+                fflush(stdout);
             }
             ok = 1;
         }
@@ -1585,30 +1818,93 @@ static void *dl_worker_thread(void *arg)
             uint64_t ms = now_ms() - t_chunk;
             double secs = (double)ms / 1000.0;
             double mbps = secs > 0.0 ? (double)len / secs / (1024.0 * 1024.0) : 0.0;
-            fprintf(stdout, "[trace] %s chunk %u (%lu B) in %llu ms (%.1f MiB/s)\n",
+            fprintf(stdout, "[trace] %s chunk %u (%lu B) end-to-end in %llu ms (%.1f MiB/s)\n",
                     c->rel_path, ci, (unsigned long)len,
                     (unsigned long long)ms, mbps);
         }
 
-        /* 记录完成位图，并限频写盘（每 100ms 最多一次，最后一片必写） */
-        mutex_lock(&c->state_mu);
-        c->entry->bitmap |= ((uint64_t)1 << ci);
-        c->done++;
-        c->done_bytes += len;
-        uint64_t t = now_ms();
-        if (c->done >= c->npending || t - c->last_save_ms >= 100) {
-            state_save(c->st, c->state_file);
-            c->last_save_ms = t;
-        }
-        mutex_unlock(&c->state_mu);
+        /* 分片已入队；写盘由写盘线程完成，这里只登记计数（不落状态文件） */
+        dl_mark_chunk_done(c, ci, len);
     }
 
-    if (fd >= 0) close_file_fd(fd);
     sock_close(sock);
     mutex_lock(&c->state_mu);
     c->finished++;
     mutex_unlock(&c->state_mu);
     return NULL;
+}
+
+/* 把各个 chunk_N.filecopy 按序号顺序拼接到 partial_path，然后删除分片文件。
+ * 用大块顺序读写（1 MiB），合并速度接近磁盘顺序复制。 */
+static int merge_chunk_parts(const char *work_dir, const char *partial_path,
+                             uint32_t nchunks, uint64_t expected_size)
+{
+    char path[MAX_PATH_BUF];
+    char name[64];
+    if (join_path_buf(path, sizeof path, work_dir, "chunk") != 0) return -1;
+
+    /* 临时目录就是下载目录，分片文件名为 chunk_%06u.filecopy */
+    uint8_t *buf = (uint8_t *)malloc(1024u * 1024u);
+    if (!buf) return -1;
+
+    char out_path[MAX_PATH_BUF];
+    if (snprintf(out_path, sizeof out_path, "%s.part", partial_path) >=
+        (int)sizeof out_path) {
+        free(buf);
+        return -1;
+    }
+    FILE *out = fopen(out_path, "wb");
+    if (!out) {
+        free(buf);
+        return -1;
+    }
+
+    uint64_t total = 0;
+    int rc = 0;
+    for (uint32_t i = 0; i < nchunks; i++) {
+        snprintf(name, sizeof name, "chunk_%06u.filecopy", (unsigned)i);
+        if (join_path_buf(path, sizeof path, work_dir, name) != 0) {
+            rc = -1;
+            break;
+        }
+        FILE *in = fopen(path, "rb");
+        if (!in) {
+            fprintf(stderr, "[recv] missing chunk part: %s\n", name);
+            rc = -1;
+            break;
+        }
+        for (;;) {
+            size_t got = fread(buf, 1, 1024u * 1024u, in);
+            if (got == 0) break;
+            if (fwrite(buf, 1, got, out) != got) {
+                rc = -1;
+                break;
+            }
+            total += got;
+        }
+        fclose(in);
+        if (rc != 0) break;
+        remove(path);   /* 已合并，删除分片文件释放空间 */
+    }
+    fflush(out);
+    fclose(out);
+    free(buf);
+
+    if (rc != 0) {
+        remove(out_path);
+        return -1;
+    }
+    if (expected_size != 0 && total != expected_size) {
+        fprintf(stderr, "[recv] merged size %llu != expected %llu\n",
+                (unsigned long long)total, (unsigned long long)expected_size);
+        remove(out_path);
+        return -1;
+    }
+    if (replace_rename(out_path, partial_path) != 0) {
+        remove(out_path);
+        return -1;
+    }
+    return 0;
 }
 
 /* 下载一个文件（含断点续传），成功返回 0 */
@@ -1754,14 +2050,35 @@ static int download_one_file(const server_info *srv, const char *dl_dir,
     }
     fflush(stdout);
 
+    /* ---- 建队列 + 写盘线程（recv 与写盘解耦） ---- */
+    chunk_queue q;
+    if (queue_init(&q, QUEUE_DEPTH) != 0) {
+        fprintf(stderr, "[recv] cannot allocate recv queue\n");
+        return -1;
+    }
+    writer_ctx wr;
+    memset(&wr, 0, sizeof wr);
+    wr.q = &q;
+    wr.work_dir = dl_dir;
+
+    thread_t wth;
+    if (thread_create(&wth, writer_thread, &wr) != 0) {
+        fprintf(stderr, "[recv] cannot create writer thread\n");
+        queue_destroy(&q);
+        return -1;
+    }
+
+    c.q = &q;
+
     thread_t tids[MAX_THREADS];
+    int started = 0;
     for (int i = 0; i < nworkers; i++) {
         if (thread_create(&tids[i], dl_worker_thread, &c) != 0) {
             fprintf(stderr, "[recv] cannot create download thread\n");
             dl_set_failed(&c);
-            nworkers = i;
             break;
         }
+        started++;
     }
 
     /* 进度监控；Ctrl+C 时立即保存状态并退出（已完成分片都在状态文件里） */
@@ -1775,7 +2092,7 @@ static int download_one_file(const server_info *srv, const char *dl_dir,
         finished = c.finished;
         db = c.done_bytes;
         mutex_unlock(&c.state_mu);
-        if (finished >= (unsigned)nworkers) break;
+        if (finished >= (unsigned)started) break;
         char hd[32], ht[32];
         double pct = size ? (double)db * 100.0 / (double)size : 100.0;
         fprintf(stdout, "\r    progress %u/%u chunks (%.1f%%), %s / %s     ",
@@ -1795,8 +2112,13 @@ static int download_one_file(const server_info *srv, const char *dl_dir,
         hard_exit(0);   /* 立即结束进程：已落盘的状态不依赖 join */
     }
 
-    for (int i = 0; i < nworkers; i++) thread_join(tids[i]);
+    for (int i = 0; i < started; i++) thread_join(tids[i]);
+    /* 接收线程全部结束 => 关闭队列（唤醒阻塞在 queue_pop 的写盘线程），
+     * 再等写盘线程把队列里剩余的块全部写完，才能安全合并。 */
+    queue_close(&q);
+    thread_join(wth);
     mutex_destroy(&c.state_mu);
+
     if (!c.failed) {
         char hs[32], ht[32];
         fprintf(stdout, "\r    progress %u/%u chunks (100.0%%), %s / %s\n",
@@ -1807,30 +2129,53 @@ static int download_one_file(const server_info *srv, const char *dl_dir,
         fputc('\n', stdout);
     }
 
-    if (c.failed) {
-        /* 失败：下载线程已全部 join，直接保存当前位图以便下次续传 */
+    if (c.failed || wr.failed) {
+        /* 失败：保存当前位图以便下次续传（已写好的分片文件会在合并时复用） */
         state_save(st, state_file);
+        queue_destroy(&q);
         fprintf(stderr, "[recv] failed to download %s\n", rel);
         return -1;
+    }
+
+    /* ---- 合并：按分片序号把 chunk_N.filecopy 顺序拼接成正式文件 ---- */
+    uint64_t t_merge = now_ms();
+    {
+        if (merge_chunk_parts(dl_dir, partial_path, nchunks, size) != 0) {
+            state_save(st, state_file);
+            queue_destroy(&q);
+            fprintf(stderr, "[recv] merge failed for %s\n", rel);
+            return -1;
+        }
+    }
+    {
+        char hs[32];
+        double msecs = (double)(now_ms() - t_merge) / 1000.0;
+        fprintf(stdout, "[recv] merged %s (%s) in %.2f s\n", rel,
+                human_size(size, hs, sizeof hs), msecs);
+        fflush(stdout);
     }
 
     /* 校验大小后改名（.filecopy -> 正式名），并清除状态记录 */
     uint64_t ps = 0;
     if (fs_file_size(partial_path, &ps) != 0 || ps != size) {
         fprintf(stderr, "[recv] size mismatch for %s\n", rel);
+        queue_destroy(&q);
         return -1;
     }
     if (replace_rename(partial_path, final_path) != 0) {
         fprintf(stderr, "[recv] rename failed: %s -> %s\n", partial_path, final_path);
+        queue_destroy(&q);
         return -1;
     }
     state_remove(st, rel);
     state_save(st, state_file);
+    queue_destroy(&q);
     {
         char hs[32];
         double secs = (double)(now_ms() - t0) / 1000.0;
-        fprintf(stdout, "[recv] done %s (%s, %u chunks, %.2f s)\n", rel,
-                human_size(size, hs, sizeof hs), nchunks, secs);
+        double mbps = secs > 0.0 ? (double)size / secs / (1024.0 * 1024.0) : 0.0;
+        fprintf(stdout, "[recv] done %s (%s, %u chunks, %.2f s, %.1f MiB/s)\n", rel,
+                human_size(size, hs, sizeof hs), nchunks, secs, mbps);
     }
     return 0;
 }
