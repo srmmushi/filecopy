@@ -1458,6 +1458,7 @@ typedef struct {
     int failed;                     /* 是否有线程判定失败 */
 
     mutex_t state_mu;               /* 保护计数、状态位图与状态文件写入 */
+    mutex_t rcv_mu;                 /* 保护 done_bytes（每 64KB 实时累加，供进度显示） */
     chunk_queue *q;                 /* recv -> 写盘 队列（可为 NULL） */
     state_store *st;
     const char *state_file;
@@ -1692,14 +1693,25 @@ static void *writer_thread(void *arg)
     return NULL;
 }
 
-/* 登记一个分片已完成（在 state_mu 保护下，只做内存计数，不落盘）。 */
+/* 登记一个分片已完成（在 state_mu 保护下，只做内存计数，不落盘）。
+ * 注意：done_bytes 的累加不在这里做——它由接收路径按 64KB 实时累加，
+ * 这样进度条才能在接收过程中平滑前进。 */
 static void dl_mark_chunk_done(dl_ctx *c, uint32_t ci, uint64_t len)
 {
+    (void)len;
     mutex_lock(&c->state_mu);
     c->entry->bitmap |= ((uint64_t)1 << ci);
     c->done++;
-    c->done_bytes += len;
     mutex_unlock(&c->state_mu);
+}
+
+/* 实时累加已接收字节（每个 64 KiB 读完后调用，供进度显示）。
+ * 用独立互斥量 rcv_mu，避免与 state_mu（状态文件写入）互相拖慢。 */
+static void dl_add_received(dl_ctx *c, uint64_t bytes)
+{
+    mutex_lock(&c->rcv_mu);
+    c->done_bytes += bytes;
+    mutex_unlock(&c->rcv_mu);
 }
 
 /* 单个下载线程：循环领取分片 => 建/复用自己的连接 => recv 入队 => 记录状态 */
@@ -1777,8 +1789,27 @@ static void *dl_worker_thread(void *arg)
                 break;
             }
             uint64_t t_recv = now_ms();
-            if (recv_all_ex(sock, buf, (size_t)len, NULL, NULL) != 0) {
-                free(buf);            /* 本次数据作废，缓冲直接丢弃，不入队 */
+            /* 关键：按 64 KiB 分段 recv 并实时累加已收字节，
+             * 这样 8 MiB 大块下载期间进度条也能平滑前进，
+             * 不再出现“卡在 0 字节 / 长时间不动”的假象。 */
+            uint64_t got = 0;
+            int recv_err = 0;
+            while (got < len) {
+                size_t want = (size_t)(len - got);
+                if (want > (size_t)NET_IO_UNIT) want = (size_t)NET_IO_UNIT;
+                if (recv_all_ex(sock, buf + got, want, NULL, NULL) != 0) {
+                    recv_err = 1;
+                    break;
+                }
+                got += want;
+                dl_add_received(c, want);
+            }
+            if (recv_err) {
+                /* 本次数据作废：把已计入的字节退回，缓冲丢弃，不入队 */
+                mutex_lock(&c->rcv_mu);
+                c->done_bytes -= got;
+                mutex_unlock(&c->rcv_mu);
+                free(buf);
                 sock_close(sock);
                 sock = SOCK_INVALID;
                 continue;
@@ -2038,6 +2069,7 @@ static int download_one_file(const server_info *srv, const char *dl_dir,
     c.entry = entry;
     c.last_save_ms = 0;
     mutex_init(&c.state_mu);
+    mutex_init(&c.rcv_mu);
 
     int nworkers = nthreads;
     if ((uint32_t)nworkers > npend) nworkers = (int)npend;
@@ -2081,8 +2113,12 @@ static int download_one_file(const server_info *srv, const char *dl_dir,
         started++;
     }
 
-    /* 进度监控；Ctrl+C 时立即保存状态并退出（已完成分片都在状态文件里） */
+    /* 进度监控：每 100ms 刷新一次。
+     * done_bytes 由接收线程按 64 KiB 实时累加，因此进度条能平滑前进，
+     * 并给出实时速率与预计剩余时间（ETA）。 */
     uint64_t t0 = now_ms();
+    uint64_t last_db = 0, last_t = t0;
+    double rate = 0.0;              /* 平滑后的速率（字节/秒） */
     for (;;) {
         unsigned int done, finished;
         uint64_t db;
@@ -2090,14 +2126,34 @@ static int download_one_file(const server_info *srv, const char *dl_dir,
         mutex_lock(&c.state_mu);
         done = c.done;
         finished = c.finished;
-        db = c.done_bytes;
         mutex_unlock(&c.state_mu);
+        mutex_lock(&c.rcv_mu);
+        db = c.done_bytes;
+        mutex_unlock(&c.rcv_mu);
         if (finished >= (unsigned)started) break;
-        char hd[32], ht[32];
+
+        uint64_t now = now_ms();
+        if (now > last_t) {
+            double inst = (double)(db - last_db) * 1000.0 / (double)(now - last_t);
+            rate = (rate <= 0.0) ? inst : (rate * 0.7 + inst * 0.3);  /* 指数平滑 */
+            last_db = db;
+            last_t = now;
+        }
+
+        char hd[32], ht[32], hr[32], he[32];
         double pct = size ? (double)db * 100.0 / (double)size : 100.0;
-        fprintf(stdout, "\r    progress %u/%u chunks (%.1f%%), %s / %s     ",
-                done, npend, pct, human_size(db, hd, sizeof hd),
-                human_size(size, ht, sizeof ht));
+        if (pct > 100.0) pct = 100.0;
+        double eta = (rate > 1.0 && size > db) ? (double)(size - db) / rate : -1.0;
+        if (eta >= 0.0)
+            snprintf(he, sizeof he, "%02d:%02d", (int)(eta / 60.0), (int)eta % 60);
+        else
+            snprintf(he, sizeof he, "--:--");
+        fprintf(stdout, "\r    progress %u/%u chunks (%.1f%%), %s / %s, %s/s, ETA %s     ",
+                done, npend, pct,
+                human_size(db, hd, sizeof hd),
+                human_size(size, ht, sizeof ht),
+                human_size((uint64_t)(rate < 0.0 ? 0.0 : rate), hr, sizeof hr),
+                he);
         fflush(stdout);
         sleep_ms(100);
     }
@@ -2118,6 +2174,7 @@ static int download_one_file(const server_info *srv, const char *dl_dir,
     queue_close(&q);
     thread_join(wth);
     mutex_destroy(&c.state_mu);
+    mutex_destroy(&c.rcv_mu);
 
     if (!c.failed) {
         char hs[32], ht[32];
