@@ -91,9 +91,18 @@ filecopy --receive --ip 192.168.1.10 --port 9000 --apikey s3cret -c downloads -t
 
 **分片规则**（收发两端共用同一算法）：
 
-- `size <= 1 MiB`：1 片；
-- 否则 `nchunks = ceil(size / 1 MiB)`，并封顶 64 片；
-- 第 i 片偏移 `i * ceil(size/nchunks)`，长度取 `min(chunk, size-start)`，最后一片收尾。
+- **固定块大小**：每块 `CHUNK_BYTES = 8 MiB`，不足 8 MiB 的文件视为 1 块；
+- 第 i 块偏移 `i * 8 MiB`，长度 `min(8 MiB, size - start)`，最后一块收尾；
+- 例：200 MiB 文件 → 25 块；3 MiB 文件 → 1 块。
+
+**传输层（性能关键）**：
+
+- 数据连接全部为**阻塞**套接字，每个下载线程独占一条连接；
+- `SO_SNDBUF` / `SO_RCVBUF` 设为 256 KiB，且**必须在 `connect()` 之前设置**才会参与窗口协商；
+- `TCP_NODELAY` 关闭 Nagle，避免小包 + 延迟 ACK 造成 40 ms 级停顿；
+- `send` / `recv` 按 **64 KiB** 为单位循环，直到整块完成；部分发送、`WSAEWOULDBLOCK`（Windows 设置了 SO_SNDTIMEO 后缓冲区满也会返回它）与 `EAGAIN`（POSIX）都会退让重试，不会误判断线；
+- 每块发送/接收都会打印耗时、吞吐、`send/recv` 调用次数与最慢单次调用，可直接定位是网络慢、磁盘慢还是单包卡顿；
+- 设置环境变量 `FILECOPY_TRACE=1` 可打开逐包（64 KiB）日志。
 
 **断点续传**：
 
@@ -144,7 +153,8 @@ filecopy --receive --ip 192.168.1.10 --port 9000 --apikey s3cret -c downloads -t
 ## 本地验证过的场景
 
 - 多文件 + 多级目录 + 空文件 + 大文件多分片的完整传输，逐文件 SHA-256 一致，完成后无 `.filecopy` / `.filecopy.state` 残留。
-- 伪造状态文件（标记部分分片已完成）后重跑：已完成分片不再请求、待下载分片补齐，最终文件除人为破坏的已完成分片区域外与原文件逐字节一致。
+- **性能基准**：200 MiB 单文件（25 × 8 MiB 块，8 线程，本机回环）**0.69 s 完成，约 290 MiB/s**，SHA-256 与原文件一致。
+- 伪造状态文件（标记部分分片已完成）后重跑：已完成分片不再请求、待下载分片补齐，最终文件除人为破坏的已完成分片区域外与原文件逐字节一致（200 MiB 场景下位图 `0x3ff` → 只下载剩余 15 块）。
 - 目标文件已存在时跳过；错误 apikey 在握手阶段被拒绝（接收端退出码 1、不落任何文件）。
 - 含空格的文件/目录路径。
-- 用 Visual Studio 项目文件（MSVC，Release x64 / Win32）编译出的 `filecopy.exe` 完成上述完整传输与断点续传验证，结果与 GCC 构建一致。
+- 用 Visual Studio 工程文件（MSVC，Release x64 / Win32）编译出的 `filecopy.exe` 完成上述完整传输与断点续传验证，结果与 GCC 构建一致。

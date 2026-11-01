@@ -19,13 +19,17 @@
  * 功能要点：
  *   - 发送端把参数中的文件/目录（递归展开）共享给接收端，并打印接入的接收端 IP。
  *   - 接收端连接发送端、拉取并打印完整文件列表（保留相对路径），然后逐文件下载。
- *   - 每个文件按大小自动切分：<= 1 MiB 视为 1 片；否则最多切成 64 片（每片约 1 MiB），
- *     由 N 个下载线程（默认 8，可 -t 配置）并发拉取。
+ *   - 每个文件按【固定 8 MiB 块】切分（不足 8 MiB 视为 1 块），由 N 个下载线程
+ *     （默认 8，可 -t 配置）并发拉取；每线程一条独立的阻塞数据连接。
+ *   - 传输层：阻塞 Socket + SO_SNDBUF/SO_RCVBUF 256KB（connect 前设置）+ TCP_NODELAY，
+ *     send/recv 按 64KB 为单位循环直到整块完成，处理部分发送与
+ *     WSAEWOULDBLOCK（Windows）/ EAGAIN（POSIX）。
  *   - 断点续传：分片完成情况写入本地状态文件 <下载目录>/.filecopy.state，
  *     未完成的文件以 "<文件名>.filecopy" 保存；重新运行会跳过已完成分片，
  *     全部完成后原子重命名为正式文件并删除状态记录。
  *   - 所有收发均带 30 秒超时；Ctrl+C（SIGINT）时保存进度后退出。
  *   - 所有连接先做 apikey 握手，校验失败立即断开。
+ *   - 环境变量 FILECOPY_TRACE=1 打开逐包 send/recv 耗时日志（排查慢点用）。
  *
  * 协议（13 字节定长头 + payload，长度字段为 uint64 大端）：
  *   +--------+---------+-------------------+
@@ -114,8 +118,10 @@
 #define HDR_LEN            13      /* 4 魔数 + 1 命令 + 8 大端长度 */
 #define DEFAULT_THREADS    8
 #define MAX_THREADS        64
-#define MAX_CHUNKS         64      /* 单文件最多分片数 */
-#define MIN_CHUNK_BYTES    (1024u * 1024u)  /* 分片目标大小下限，<= 该值的文件 1 片 */
+#define CHUNK_BYTES        (8ull * 1024ull * 1024ull)  /* 固定分片大小 8 MiB */
+#define MAX_CHUNKS         65536  /* 分片索引上限保护（8 MiB * 65536 = 512 GiB） */
+#define NET_BUF_BYTES      (256 * 1024)  /* SO_SNDBUF / SO_RCVBUF */
+#define NET_IO_UNIT        (64 * 1024)   /* 单次 send/recv 的块大小 */
 #define IO_TIMEOUT_SEC     30      /* 收发超时（秒） */
 #define CONNECT_TIMEOUT_SEC 10     /* connect 超时（秒） */
 #define MAX_APIKEY_LEN     1024
@@ -303,17 +309,45 @@ static uint64_t get_u64be(const uint8_t *p)
     return v;
 }
 
-/* ======================== socket 封装（Windows / POSIX） ======================== */
+/* ======================== socket 封装（Windows / POSIX） ========================
+ *
+ * 数据连接全部使用【阻塞】套接字：
+ *   - 非阻塞 + 每次 select 等待会让每 64KB 数据都多一次内核往返，
+ *     在小块发送时会把吞吐压到几十 KB/s（原实现 3MB/分钟的主因之一）。
+ *   - 阻塞模式下 send/recv 由内核直接等待窗口，CPU 占用低、吞吐高。
+ * 但阻塞套接字仍可能出现“部分发送/部分接收”（受发送缓冲区与接收窗口限制），
+ * 因此 send/recv 必须循环到整块完成；同时兼容 WSAEWOULDBLOCK / EAGAIN
+ * （套接字被临时设为非阻塞，或设置了 SO_SNDTIMEO 时 Windows 也会返回该错误）。
+ */
 
 #ifdef _WIN32
 typedef SOCKET sock_t;
 #  define SOCK_INVALID INVALID_SOCKET
 typedef int fc_socklen_t;   /* MinGW 一般有 socklen_t，MSVC 没有，统一用 int */
+
+/* Windows：判断是否“暂时无法收发，稍后重试” */
+static int wsa_would_block(int err) { return err == WSAEWOULDBLOCK; }
+/* Windows：send/recv 超时（设置了 SO_SNDTIMEO/SO_RCVTIMEO） */
+static int wsa_timed_out(int err) { return err == WSAETIMEDOUT; }
 #else
 typedef int sock_t;
 #  define SOCK_INVALID (-1)
 typedef socklen_t fc_socklen_t;
+
+/* POSIX：EAGAIN 与 EWOULDBLOCK 通常是同一个值，两个都判 */
+static int wsa_would_block(int err) { return err == EAGAIN || err == EWOULDBLOCK; }
+static int wsa_timed_out(int err) { return err == EAGAIN || err == EWOULDBLOCK; }
 #endif
+
+/* 取最近一次 socket 错误码（Windows 是 WSA*，POSIX 是 errno） */
+static int sock_last_error(void)
+{
+#ifdef _WIN32
+    return WSAGetLastError();
+#else
+    return errno;
+#endif
+}
 
 static int sock_valid(sock_t s) { return s != SOCK_INVALID; }
 
@@ -343,13 +377,33 @@ static void sock_set_timeouts(sock_t s, int sec)
 #endif
 }
 
-static void sock_tune(sock_t s)
+/* 传输层统计（用于 *_TRACE 调试日志与整块耗时统计） */
+typedef struct {
+    uint64_t calls;     /* send/recv 调用次数 */
+    uint64_t bytes;     /* 实际传输字节数 */
+    uint64_t wall_ms;   /* 累计耗时 */
+    uint64_t max_ms;    /* 单次最慢调用耗时 */
+} io_stat;
+
+/* 连接级调试日志开关：环境变量 FILECOPY_TRACE=1 打开（每秒/每块的日志会很多） */
+static int g_trace = 0;
+
+/* 关闭 Nagle：小包场景下 Nagle + 延迟 ACK 会造成 40ms 级的停顿 */
+static void sock_no_delay(sock_t s)
 {
     int one = 1;
-    sock_set_timeouts(s, IO_TIMEOUT_SEC);
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, (int)sizeof one);
 }
 
+/* 设置收发缓冲区（必须在 connect() 之前设置，否则内核窗口已经协商好） */
+static void sock_set_buffers(sock_t s, int bytes)
+{
+    int sz = bytes;
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char *)&sz, (int)sizeof sz);
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&sz, (int)sizeof sz);
+}
+
+/* 切换阻塞 / 非阻塞 */
 static int sock_set_nonblock(sock_t s, int on)
 {
 #ifdef _WIN32
@@ -364,47 +418,151 @@ static int sock_set_nonblock(sock_t s, int on)
 #endif
 }
 
-/* 完整发送，处理部分发送与超时 */
-static int send_all(sock_t s, const void *buf, size_t len)
+/* 数据连接统一初始化：阻塞模式 + 256KB 收发缓冲 + TCP_NODELAY + 超时 */
+static void sock_tune_data(sock_t s)
+{
+    int sz = NET_BUF_BYTES;
+    sock_set_nonblock(s, 0);           /* 强制回到阻塞模式 */
+    sock_no_delay(s);
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char *)&sz, (int)sizeof sz);
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&sz, (int)sizeof sz);
+    sock_set_timeouts(s, IO_TIMEOUT_SEC);
+}
+
+/* 控制连接（列表 / 握手）也统一初始化，保持原有行为 */
+static void sock_tune(sock_t s)
+{
+    sock_set_nonblock(s, 0);
+    sock_no_delay(s);
+    sock_set_timeouts(s, IO_TIMEOUT_SEC);
+}
+
+/* 完整发送：循环直到整块发完。
+ *
+ * - 每次最多发 NET_IO_UNIT(64KB)，避免一次超大 send 让内核拆包浪费；
+ * - 部分发送（返回值 < 本次请求）继续循环；
+ * - WSAEWOULDBLOCK / EAGAIN：Windows 在设置了 SO_SNDTIMEO 时，缓冲区满会返回
+ *   WSAEWOULDBLOCK（Linux 阻塞套接字遇超时返回 EAGAIN），此时 Sleep(1) 后重试；
+ * - 其他错误：记录并返回 -1（调用方断开连接）。
+ * trace 非空时按 64KB 记录字节数与耗时。
+ */
+static int send_all_ex(sock_t s, const void *buf, size_t len, io_stat *st, const char *tag)
 {
     const char *p = (const char *)buf;
-    size_t off = 0;
-    while (off < len) {
-        size_t n = len - off;
-        if (n > (1u << 20)) n = 1u << 20;
-#ifdef _WIN32
-        int r = send(s, p + off, (int)n, 0);
-        if (r == SOCKET_ERROR || r == 0) return -1;
-#else
-        ssize_t r = send(s, p + off, n, 0);
-        if (r <= 0) return -1;
-#endif
-        off += (size_t)r;
+    size_t sent = 0;
+
+    while (sent < len) {
+        size_t unit = len - sent;
+        if (unit > (size_t)NET_IO_UNIT) unit = (size_t)NET_IO_UNIT;
+        if (g_stop) return -1;
+
+        uint64_t t0 = now_ms();
+        int n = send(s, p + sent, (int)unit, 0);
+        uint64_t t1 = now_ms();
+
+        if (n > 0) {
+            sent += (size_t)n;
+            if (st) {
+                st->calls++;
+                st->bytes += (uint64_t)n;
+                st->wall_ms += (t1 - t0);
+                if (t1 - t0 > st->max_ms) st->max_ms = t1 - t0;
+            }
+            if (g_trace && tag)
+                fprintf(stdout, "[trace] %s send %d B in %llu ms\n", tag, n,
+                        (unsigned long long)(t1 - t0));
+            continue;
+        }
+        if (n == 0) {
+            fprintf(stderr, "[net] send returned 0, peer gone\n");
+            return -1;
+        }
+        int err = sock_last_error();
+        if (wsa_would_block(err) || wsa_timed_out(err)) {
+            /* 临时无法发送（窗口满 / 超时）：退让一小会儿再重试 */
+            if (g_trace && tag)
+                fprintf(stderr, "[trace] %s send would-block after %zu B, retrying\n",
+                        tag, sent);
+            sleep_ms(1);
+            continue;
+        }
+        fprintf(stderr, "[net] send error %d after %zu/%zu bytes\n", err, sent, len);
+        return -1;
     }
     return 0;
 }
 
-/* 完整接收，处理部分接收；对端关闭或超时返回 -1 */
-static int recv_all(sock_t s, void *buf, size_t len)
+static int send_all(sock_t s, const void *buf, size_t len)
+{
+    return send_all_ex(s, buf, len, NULL, NULL);
+}
+
+/* 完整接收：循环直到读满 len（协议头声明的长度）。
+ *
+ * - 每次最多收 NET_IO_UNIT(64KB)；
+ * - 返回 0 表示对端正常关闭（连接中断）；
+ * - WSAEWOULDBLOCK / EAGAIN：SO_RCVTIMEO 到期，退让后继续等，避免误判为断线；
+ * - 其他错误：记录并返回 -1。
+ */
+static int recv_all_ex(sock_t s, void *buf, size_t len, io_stat *st, const char *tag)
 {
     char *p = (char *)buf;
-    size_t off = 0;
-    while (off < len) {
-        size_t n = len - off;
-        if (n > (1u << 20)) n = 1u << 20;
-#ifdef _WIN32
-        int r = recv(s, p + off, (int)n, 0);
-        if (r == SOCKET_ERROR || r == 0) return -1;
-#else
-        ssize_t r = recv(s, p + off, n, 0);
-        if (r <= 0) return -1;
-#endif
-        off += (size_t)r;
+    size_t got = 0;
+    int timeouts = 0;
+
+    while (got < len) {
+        size_t unit = len - got;
+        if (unit > (size_t)NET_IO_UNIT) unit = (size_t)NET_IO_UNIT;
+        if (g_stop) return -1;
+
+        uint64_t t0 = now_ms();
+        int n = recv(s, p + got, (int)unit, 0);
+        uint64_t t1 = now_ms();
+
+        if (n > 0) {
+            got += (size_t)n;
+            timeouts = 0;
+            if (st) {
+                st->calls++;
+                st->bytes += (uint64_t)n;
+                st->wall_ms += (t1 - t0);
+                if (t1 - t0 > st->max_ms) st->max_ms = t1 - t0;
+            }
+            if (g_trace && tag && (t1 - t0) > 50)
+                fprintf(stdout, "[trace] %s recv %d B in %llu ms\n", tag, n,
+                        (unsigned long long)(t1 - t0));
+            continue;
+        }
+        if (n == 0) {
+            fprintf(stderr, "[net] peer closed connection after %zu/%zu bytes\n", got, len);
+            return -1;
+        }
+        int err = sock_last_error();
+        if (wsa_would_block(err) || wsa_timed_out(err)) {
+            /* 超时重试：连续多次仍无数据才判定失败 */
+            if (++timeouts > IO_TIMEOUT_SEC * 4) {
+                fprintf(stderr, "[net] recv stalled at %zu/%zu bytes\n", got, len);
+                return -1;
+            }
+            if (g_trace && tag)
+                fprintf(stderr, "[trace] %s recv would-block at %zu/%zu B\n", tag, got, len);
+            sleep_ms(1);
+            continue;
+        }
+        fprintf(stderr, "[net] recv error %d after %zu/%zu bytes\n", err, got, len);
+        return -1;
     }
     return 0;
 }
 
-/* 非阻塞 connect + select 超时，成功后恢复阻塞并设置收发超时 */
+static int recv_all(sock_t s, void *buf, size_t len)
+{
+    return recv_all_ex(s, buf, len, NULL, NULL);
+}
+
+/* connect：先设收发缓冲再做（非阻塞 connect + select 超时），成功后转为阻塞。
+ * 说明：SO_SNDBUF/SO_RCVBUF 必须在 connect 之前设置才会参与窗口协商，
+ * 否则可能一直使用默认 64KB 窗口，长肥管道（局域网低延迟）下吞吐被限制。 */
 static sock_t connect_tcp(const char *host, uint16_t port, int timeout_sec)
 {
     struct addrinfo hints, *res = NULL, *ai;
@@ -420,6 +578,10 @@ static sock_t connect_tcp(const char *host, uint16_t port, int timeout_sec)
     for (ai = res; ai; ai = ai->ai_next) {
         s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (!sock_valid(s)) continue;
+
+        /* 关键：connect 之前把缓冲区开到 256KB */
+        sock_set_buffers(s, NET_BUF_BYTES);
+        sock_no_delay(s);
 
         sock_set_nonblock(s, 1);
         int need_wait = 0;
@@ -489,7 +651,10 @@ static sock_t accept_with_wait(sock_t ls, struct sockaddr_storage *peer)
     if (rc <= 0) return SOCK_INVALID;
     fc_socklen_t slen = sizeof(*peer);
     sock_t s = accept(ls, (struct sockaddr *)peer, &slen);
-    if (sock_valid(s)) sock_tune(s);
+    if (sock_valid(s)) {
+        /* 数据连接：256KB 收发缓冲 + TCP_NODELAY + 阻塞模式 */
+        sock_tune_data(s);
+    }
     return s;
 }
 
@@ -703,26 +868,38 @@ static int client_handshake(sock_t s, const char *apikey)
     return -1;
 }
 
-/* ======================== 分片划分规则（双端必须一致） ======================== */
+/* ======================== 分片划分规则（双端必须一致） ========================
+ *
+ * 改为【固定块大小】而不是固定块数：
+ *   - 每块 CHUNK_BYTES = 8 MiB；不足 8 MiB 的小文件视为 1 块；
+ *   - 原来“最多 64 块”会让 198MB 文件出现 3.1MB 以上的大块，
+ *     且块数与文件大小耦合（小文件分片过碎、大文件分片过大），
+ *     固定块大小让每个请求的数据量可预期，也便于断点位图计算。
+ */
 
 static uint32_t chunk_count(uint64_t size)
 {
     if (size == 0) return 0;                    /* 空文件：没有分片，直接建空文件 */
-    if (size <= (uint64_t)MIN_CHUNK_BYTES) return 1;  /* 小文件 1 片 */
-    uint64_t n = (size + MIN_CHUNK_BYTES - 1) / MIN_CHUNK_BYTES;
-    if (n > MAX_CHUNKS) n = MAX_CHUNKS;         /* 大文件封顶 64 片 */
+    uint64_t n = (size + CHUNK_BYTES - 1) / CHUNK_BYTES;
+    if (n == 0) n = 1;
+    if (n > (uint64_t)MAX_CHUNKS) n = MAX_CHUNKS;
     return (uint32_t)n;
 }
 
-/* 第 idx 片的字节数（chunk_sz = ceil(size/nchunks)） */
+/* 第 idx 块在文件中的起始偏移 */
+static uint64_t chunk_offset(uint32_t idx)
+{
+    return (uint64_t)idx * CHUNK_BYTES;
+}
+
+/* 第 idx 块的字节数：除最后一块外都是 CHUNK_BYTES */
 static uint64_t chunk_bytes(uint64_t size, uint32_t nchunks, uint32_t idx)
 {
     if (nchunks == 0 || idx >= nchunks) return 0;
-    uint64_t cs = size / nchunks + (size % nchunks ? 1 : 0);
-    uint64_t start = cs * (uint64_t)idx;
+    uint64_t start = chunk_offset(idx);
     if (start >= size) return 0;
     uint64_t remain = size - start;
-    return remain < cs ? remain : cs;
+    return remain < CHUNK_BYTES ? remain : CHUNK_BYTES;
 }
 
 static uint64_t mask_for(uint32_t nchunks)
@@ -1214,8 +1391,7 @@ typedef struct {
     const char *rel_path;
     const char *partial_path;
     uint64_t file_size;
-    uint32_t nchunks;
-    uint64_t chunk_sz;      /* ceil(file_size / nchunks) */
+    uint32_t nchunks;       /* 分片数 = ceil(file_size / CHUNK_BYTES) */
     uint32_t pending[MAX_CHUNKS];
     uint32_t npending;
 
@@ -1245,19 +1421,31 @@ static sock_t connect_and_auth(const server_info *srv)
     return s;
 }
 
-/* 从连接上流式接收分片数据并写到文件偏移处，内存占用固定 256 KiB */
-static int recv_chunk_into_file(sock_t s, int fd, uint64_t off, uint64_t len)
+/* 从连接上流式接收分片数据并写到文件偏移处。
+ * 按 NET_IO_UNIT(64KB) 反复 recv，直到读满协议头声明的 len；
+ * 阻塞套接字下 recv_all_ex 内部已处理好部分接收与 WSAEWOULDBLOCK。 */
+static int recv_chunk_into_file(sock_t s, int fd, uint64_t off, uint64_t len,
+                                io_stat *st, const char *tag)
 {
+    uint8_t *buf = (uint8_t *)malloc((size_t)NET_IO_UNIT);
+    if (!buf) return -1;
     uint64_t got = 0;
-    uint8_t buf[256 * 1024];
+    int rc = 0;
     while (got < len) {
         size_t want = (size_t)(len - got);
-        if (want > sizeof buf) want = sizeof buf;
-        if (recv_all(s, buf, want) != 0) return -1;
-        if (write_at(fd, buf, want, off + got) != 0) return -1;
+        if (want > (size_t)NET_IO_UNIT) want = (size_t)NET_IO_UNIT;
+        if (recv_all_ex(s, buf, want, st, tag) != 0) {
+            rc = -1;
+            break;
+        }
+        if (write_at(fd, buf, want, off + got) != 0) {
+            rc = -1;
+            break;
+        }
         got += want;
     }
-    return 0;
+    free(buf);
+    return rc;
 }
 
 /* 下面三个小函数在 state_mu 保护下访问共享计数与失败标志。
@@ -1303,9 +1491,10 @@ static void *dl_worker_thread(void *arg)
         if (dl_failed(c)) break;
         if (dl_claim_chunk(c, &ci) != 0) break;
 
-        uint64_t off = c->chunk_sz * (uint64_t)ci;
+        uint64_t off = chunk_offset(ci);
         uint64_t len = chunk_bytes(c->file_size, c->nchunks, ci);
         int ok = 0;
+        uint64_t t_chunk = now_ms();
 
         for (int attempt = 1; attempt <= MAX_CHUNK_ATTEMPTS && !ok; attempt++) {
             if (g_stop || dl_failed(c)) break;
@@ -1363,10 +1552,22 @@ static void *dl_worker_thread(void *arg)
                     break;
                 }
             }
-            if (recv_chunk_into_file(sock, fd, off, len) != 0) {
+            /* 请求该块并读满协议头声明的长度（64KB 循环 recv + 落盘） */
+            io_stat stt;
+            memset(&stt, 0, sizeof stt);
+            if (recv_chunk_into_file(sock, fd, off, len, &stt,
+                                     g_trace ? c->rel_path : NULL) != 0) {
                 sock_close(sock);
                 sock = SOCK_INVALID;
                 continue;
+            }
+            if (g_trace) {
+                uint64_t ms = now_ms() - t_chunk;
+                fprintf(stdout, "[trace] %s chunk %u recv %llu calls, slowest %llu ms, "
+                                "chunk total %llu ms\n",
+                        c->rel_path, ci, (unsigned long long)stt.calls,
+                        (unsigned long long)stt.max_ms,
+                        (unsigned long long)ms);
             }
             ok = 1;
         }
@@ -1378,6 +1579,15 @@ static void *dl_worker_thread(void *arg)
                         ci, c->rel_path, MAX_CHUNK_ATTEMPTS);
             }
             break;
+        }
+
+        if (g_trace) {
+            uint64_t ms = now_ms() - t_chunk;
+            double secs = (double)ms / 1000.0;
+            double mbps = secs > 0.0 ? (double)len / secs / (1024.0 * 1024.0) : 0.0;
+            fprintf(stdout, "[trace] %s chunk %u (%lu B) in %llu ms (%.1f MiB/s)\n",
+                    c->rel_path, ci, (unsigned long)len,
+                    (unsigned long long)ms, mbps);
         }
 
         /* 记录完成位图，并限频写盘（每 100ms 最多一次，最后一片必写） */
@@ -1466,8 +1676,6 @@ static int download_one_file(const server_info *srv, const char *dl_dir,
         return 0;
     }
 
-    uint64_t chunk_sz = size / nchunks + (size % nchunks ? 1 : 0);
-
     /* 读取 / 初始化该文件的断点位图 */
     state_entry *entry = state_find(st, rel);
     if (!entry) {
@@ -1527,7 +1735,6 @@ static int download_one_file(const server_info *srv, const char *dl_dir,
     c.partial_path = partial_path;
     c.file_size = size;
     c.nchunks = nchunks;
-    c.chunk_sz = chunk_sz;
     memcpy(c.pending, pending, npend * sizeof pending[0]);
     c.npending = npend;
     c.st = st;
@@ -1790,8 +1997,11 @@ static file_list g_share;               /* 启动时收集，之后只读 */
 static uint8_t *g_share_payload = NULL; /* 预序列化的 LIST_DATA payload */
 static uint64_t g_share_payload_len = 0;
 
-/* 处理一个 GET 分片请求：先发 DATA 头（含分片长度），再流式发送文件内容 */
-static int serve_chunk(sock_t s, uint32_t fid, uint32_t cidx)
+/* 处理一个 GET 分片请求：先发 DATA 头（含分片长度），再流式发送文件内容。
+ *
+ * 发送按 64KB 为单位循环 send（由 send_all_ex 保证），单次请求的整块耗时
+ * 与吞吐写入日志，便于定位是网络慢还是磁盘慢。 */
+static int serve_chunk(sock_t s, uint32_t fid, uint32_t cidx, const char *peer)
 {
     if ((size_t)fid >= g_share.count) {
         const char *m = "bad file id";
@@ -1805,10 +2015,10 @@ static int serve_chunk(sock_t s, uint32_t fid, uint32_t cidx)
         proto_send_msg(s, CMD_ERR, m, strlen(m));
         return -1;
     }
-    uint64_t cs = fe->size / nchunks + (fe->size % nchunks ? 1 : 0);
-    uint64_t off = cs * (uint64_t)cidx;
+    uint64_t off = chunk_offset(cidx);
     uint64_t len = chunk_bytes(fe->size, nchunks, cidx);
 
+    uint64_t t_all = now_ms();
     FILE *f = fopen(fe->fs_path, "rb");
     if (!f) {
         const char *m = "file open failed on sender";
@@ -1823,24 +2033,54 @@ static int serve_chunk(sock_t s, uint32_t fid, uint32_t cidx)
         fclose(f);
         return -1;
     }
-    uint8_t buf[256 * 1024];
+
+    /* 64KB 读盘缓冲：与 NET_IO_UNIT 对齐，避免一次 8MB 的大块 send */
+    uint8_t *buf = (uint8_t *)malloc((size_t)NET_IO_UNIT);
+    if (!buf) {
+        fclose(f);
+        return -1;
+    }
+    io_stat stt;
+    memset(&stt, 0, sizeof stt);
+    uint64_t read_ms = 0;
     uint64_t sent = 0;
+    int rc = 0;
     while (sent < len) {
         size_t want = (size_t)(len - sent);
-        if (want > sizeof buf) want = sizeof buf;
+        if (want > (size_t)NET_IO_UNIT) want = (size_t)NET_IO_UNIT;
+        uint64_t tr = now_ms();
         size_t got = fread(buf, 1, want, f);
+        read_ms += now_ms() - tr;
         if (got != want) {
-            fclose(f);
-            return -1; /* 文件在传输途中被截断：断开让客户端重试 */
+            rc = -1; /* 文件在传输途中被截断：断开让客户端重试 */
+            break;
         }
-        if (send_all(s, buf, got) != 0) {
-            fclose(f);
-            return -1;
+        if (send_all_ex(s, buf, got, &stt, g_trace ? peer : NULL) != 0) {
+            rc = -1;
+            break;
         }
         sent += got;
     }
+    free(buf);
     fclose(f);
-    return 0;
+
+    {
+        uint64_t total_ms = now_ms() - t_all;
+        double mbps = 0.0;
+        double secs = (double)total_ms / 1000.0;
+        if (secs > 0.0) mbps = (double)sent / secs / (1024.0 * 1024.0);
+        fprintf(stdout, "[send] chunk %u/%u of %s (%lu B) sent in %llu ms "
+                        "(read %llu ms, send calls %llu, slowest %llu ms, %.1f MiB/s)%s\n",
+                cidx + 1, nchunks, fe->path,
+                (unsigned long)sent,
+                (unsigned long long)total_ms,
+                (unsigned long long)read_ms,
+                (unsigned long long)stt.calls,
+                (unsigned long long)stt.max_ms,
+                mbps, rc == 0 ? "" : " [FAILED]");
+        fflush(stdout);
+    }
+    return rc;
 }
 
 typedef struct {
@@ -1893,7 +2133,7 @@ static void *serve_conn_thread(void *arg)
             if (recv_all(s, req, 8) != 0) break;
             uint32_t fid = get_u32be(req);
             uint32_t cidx = get_u32be(req + 4);
-            if (serve_chunk(s, fid, cidx) != 0) break;
+            if (serve_chunk(s, fid, cidx, peer) != 0) break;
         } else {
             const char *m = "unknown command";
             proto_send_msg(s, CMD_ERR, m, strlen(m));
@@ -2181,6 +2421,16 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
 #endif
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    /* FILECOPY_TRACE=1 打开逐包 send/recv 调试日志（默认关闭） */
+    {
+        const char *tr = getenv("FILECOPY_TRACE");
+        if (tr && tr[0] && strcmp(tr, "0") != 0) {
+            g_trace = 1;
+            fprintf(stdout, "[net] trace mode on: sndbuf/rcvbuf %d KiB, io unit %d KiB\n",
+                    NET_BUF_BYTES / 1024, NET_IO_UNIT / 1024);
+        }
+    }
 
     options opt;
     memset(&opt, 0, sizeof opt);
